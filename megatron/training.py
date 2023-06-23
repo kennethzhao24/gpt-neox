@@ -1,24 +1,6 @@
-# Copyright (c) 2021, EleutherAI
-# This file is based on code by the authors denoted below and has been modified from its original version.
-#
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# This file has been modified from its original version
-#
-
-"""Pretrain utilities."""
+"""
+    Pretrain utilities.
+"""
 from datetime import datetime
 from functools import partial
 
@@ -28,7 +10,6 @@ import sys
 import torch
 import deepspeed
 from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
-import numpy as np
 
 from megatron.utils import (
     Timers,
@@ -39,10 +20,13 @@ from megatron.utils import (
 
 from megatron import print_rank_0, mpu
 from megatron.model import (
+    OPTModelPipe,
     GPT2ModelPipe,
     SoftEmbedding,
     get_params_for_weight_decay_optimization,
 )
+
+
 from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.data.data_utils import build_train_valid_test_data_iterators
 from megatron.initialize import initialize_megatron

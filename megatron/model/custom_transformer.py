@@ -1,21 +1,6 @@
-# Copyright (c) 2021 EleutherAI
-# This file is based on code by the authors denoted below and has been modified from its original version.
-#
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Transformer."""
+"""
+    OPT Transformer.
+"""
 
 import math
 import torch
@@ -27,12 +12,6 @@ from megatron import mpu
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.activations import get_activation
 from megatron.model.utils import exists, get_fusion_type
-from megatron.model.positional_embeddings import (
-    RotaryEmbedding,
-    apply_rotary_pos_emb_torch,
-    apply_rotary_pos_emb,
-    AliBi,
-)
 from megatron.model.fused_bias_dropout import (
     get_bias_dropout_add,
     bias_dropout_add_fused_train,
@@ -45,67 +24,43 @@ torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_override_can_fuse_on_cpu(True)
 torch._C._jit_override_can_fuse_on_gpu(True)
+ 
 
-""" We use the following notation throughout this file:
-     h: hidden size
-     n: number of attention heads
-     p: number of model parallel partitions
-     np: n/p
-     hp: h/p
-     hn: h/n
-     b: batch size
-     s: sequence length
-     l: number of layers
-    Transformer takes input of size [s, b, h] and returns a
-    tensor of the same size. We use the following arguments:
-        hyperparameters: transformer hyperparameters
-        attention_mask_func: a function that takes `unmasked-attention-scores`
-            with size [b, np, s, s] and an `attention-mask` and will apply
-            the masking. The function should return a masked score of the
-            same size [b, np, s, s].
-               masked-attention-scores = attention_mask_func(
-                                     unmasked-attention-scores, attention-mask)
-"""
 
 
 class ParallelMLP(nn.Module):
-    """MLP.
-
-    MLP will take the input with h hidden state, project it to 4*h
-    hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension. At the end, dropout is also
-    applied.
+    """
+        MLP will take the input with h hidden state, project it to ffn
+        hidden dimension, perform nonlinear transformation, and project the
+        state back into h hidden dimension. At the end, dropout is also
+        applied.
     """
 
     def __init__(
-        self, neox_args, init_method, output_layer_init_method, parallel_output=False
-    ):
+            self, 
+            neox_args,
+            init_method, 
+            output_layer_init_method, 
+            parallel_output=False
+            ):
         super().__init__()
 
         self.activation_func = get_activation(neox_args)
         self.activation_type = neox_args.activation
         self.bias_gelu_fusion = neox_args.bias_gelu_fusion
 
-        # auto scale so geglu has equal parameters
-        ff_mult = int(4 * 2 / 3) if self.activation_type == "geglu" else 4
-        ff_dim = (
-            int(ff_mult * neox_args.hidden_size) * 2
-            if self.activation_type == "geglu"
-            else ff_mult * neox_args.hidden_size
-        )
-        self.dense_h_to_4h = mpu.ColumnParallelLinear(
+        self.fc1 = mpu.ColumnParallelLinear(
             neox_args=neox_args,
             input_size=neox_args.hidden_size,
-            output_size=ff_dim,
+            output_size=neox_args.ffn_dim,
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
         )
-        ff_dim_in = ff_dim // 2 if self.activation_type == "geglu" else ff_dim
-        # Project back to h.
-        self.dense_4h_to_h = mpu.RowParallelLinear(
+
+        self.fc2 = mpu.RowParallelLinear(
             neox_args=neox_args,
-            input_size=ff_dim_in,
+            input_size=neox_args.ffn_dim,
             output_size=neox_args.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method,
@@ -114,9 +69,8 @@ class ParallelMLP(nn.Module):
         )
 
     def forward(self, hidden_states):
-
         # [s, b, 4hp]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
+        intermediate_parallel, bias_parallel = self.fc1(hidden_states)
 
         if (
             self.activation_type == "gelu" and self.bias_gelu_fusion
@@ -130,81 +84,19 @@ class ParallelMLP(nn.Module):
             )
 
         # [s, b, h]
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        output, output_bias = self.fc2(intermediate_parallel)
         return output, output_bias
-
-
-class LLaMAParallelMLP(nn.Module):
-    """LLaMA's MLP.
-
-    MLP will take the input with h hidden state, project it to 4*h
-    hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension. At the end, dropout is also
-    applied.
-
-    Note: multiple_of is used to compute the hidden dimension of the MLP
-    """
-
-    def __init__(
-        self,
-        neox_args,
-        init_method,
-        output_layer_init_method,
-        parallel_output=False,
-        multiple_of=256,
-    ):
-        super().__init__()
-
-        self.activation_func = get_activation(neox_args)
-        self.activation_type = neox_args.activation
-
-        self.multiple_of = multiple_of
-
-        ff_dim = int(2 * neox_args.hidden_size * 4 / 3)
-        ff_dim = self.multiple_of * ((ff_dim + multiple_of - 1) // multiple_of)
-        self.w1 = mpu.ColumnParallelLinear(
-            neox_args=neox_args,
-            input_size=neox_args.hidden_size,
-            output_size=ff_dim,
-            gather_output=False,
-            init_method=init_method,
-            skip_bias_add=True,
-            bias=False,
-        )
-        self.w3 = mpu.ColumnParallelLinear(
-            neox_args=neox_args,
-            input_size=neox_args.hidden_size,
-            output_size=ff_dim,
-            gather_output=False,
-            init_method=init_method,
-            skip_bias_add=True,
-            bias=False,
-        )
-        self.w2 = mpu.RowParallelLinear(
-            neox_args=neox_args,
-            input_size=ff_dim,
-            output_size=neox_args.hidden_size,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            parallel_output=parallel_output,
-            bias=False,
-        )
-
-    def forward(self, hidden_states):
-        w1_out, _ = self.w1(hidden_states)
-        w3_out, _ = self.w3(hidden_states)
-        return self.w2(self.activation_func(w1_out) * w3_out)
 
 
 class ParallelLinear(nn.Module):
     """
-        A Parallel Linear Layer transforming the transformer outputs from hidden_size -> vocab_size
+        A Parallel Linear Layer transforming the transformer outputs from hidden_size -> output_size
     """
-
     def __init__(
         self,
         neox_args,
+        input_size,
+        output_size,
         parallel_output=True,
         init_method=nn.init.xavier_normal_,
         is_last_layer=False,
@@ -214,23 +106,25 @@ class ParallelLinear(nn.Module):
         if parallelism == "column":
             self.final_linear = mpu.ColumnParallelLinear(
                 neox_args=neox_args,
-                input_size=neox_args.hidden_size,
-                output_size=neox_args.padded_vocab_size,
+                input_size=input_size,
+                output_size=output_size,
                 bias=False,
                 init_method=init_method,
                 gather_output=not parallel_output,
                 skip_bias_add=False,
                 mup_rescale_parameters=is_last_layer,  # rescale params only called if neox_args.use_mup = True, despite it not being included here
             )
+
     def forward(self, hidden_states):
         return self.final_linear(hidden_states)
 
 
 class ParallelSelfAttention(nn.Module):
-    """Parallel self-attention layer abstract class.
+    """
+        Parallel self-attention layer abstract class.
 
-    Self-attention layer takes input with size [b, s, h]
-    and returns output of the same size.
+        Self-attention layer takes input with size [b, s, h]
+        and returns output of the same size.
     """
 
     def __init__(
@@ -239,11 +133,8 @@ class ParallelSelfAttention(nn.Module):
         attention_mask_func,
         init_method,
         output_layer_init_method,
-        layer_number,
-        rpe=None,
-        rotary=False,
-        use_cache=False,
         parallel_output=False,
+        use_cache=False,
     ):
         super().__init__()
 
@@ -255,7 +146,8 @@ class ParallelSelfAttention(nn.Module):
         self.attention_softmax_in_fp32 = neox_args.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
-        self.layer_number = layer_number
+        neox_args.num_attention_heads = neox_args.hidden_size // neox_args.head_dim
+
         # Per attention head and per partition values.
         world_size = mpu.get_model_parallel_world_size()
         self.hidden_size_per_partition = mpu.divide(neox_args.hidden_size, world_size)
@@ -277,45 +169,11 @@ class ParallelSelfAttention(nn.Module):
             bias=neox_args.use_bias_in_attn_linear,
         )
 
-        coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        if self.apply_query_key_layer_scaling:
-            coeff = max(1, self.layer_number)
-            self.norm_factor *= coeff
-
         if neox_args.use_mup:
             self.norm_factor = self.hidden_size_per_attention_head
 
-        self.rpe = rpe
-
-        if self.pos_emb == "alibi":
-            self.alibi_embed = AliBi(
-                neox_args.num_attention_heads,
-                neox_args.model_parallel_size,
-                mpu.get_model_parallel_rank(),
-            )
-
-        # TODO: this arg shouldn't need to be passed in - get from neox_args
-        if rotary:
-            if neox_args.rotary_pct == 1:
-                self.rotary_ndims = None
-            else:
-                assert neox_args.rotary_pct < 1
-                self.rotary_ndims = int(
-                    self.hidden_size_per_attention_head * neox_args.rotary_pct
-                )
-            dim = (
-                self.rotary_ndims
-                if self.rotary_ndims is not None
-                else self.hidden_size_per_attention_head
-            )
-            self.rotary_emb = RotaryEmbedding(
-                dim, base=neox_args.rotary_emb_base, precision=neox_args.params_dtype
-            )
-        else:
-            self.rotary_emb = None
-
-        self.attention_type = neox_args.attention_config[layer_number]
+        self.attention_type = neox_args.attention_type
         self.use_flash_attention = self.attention_type == "flash"
         self.sparse = self.attention_type not in ("global", "flash")
         if self.sparse:
@@ -336,6 +194,9 @@ class ParallelSelfAttention(nn.Module):
                 self.flash_triton_fn = flash_attn_unpadded_unpacked_func_triton
                 self.flash_qkv_fn = flash_attn_unpadded_qkvpacked_func_cuda
                 self.flash_kv_fn = flash_attn_unpadded_kvpacked_func_cuda
+            # Dropout. Note that for a single iteration, this layer will generate
+            # different outputs on different number of parallel partitions but
+            # on average it should not be partition dependent.
             else:
                 self.scale_mask_softmax = FusedScaleMaskSoftmax(
                     input_in_fp16=self.fp16,
@@ -343,12 +204,8 @@ class ParallelSelfAttention(nn.Module):
                     fusion_type=get_fusion_type(neox_args),
                     mask_func=self.attention_mask_func,
                     softmax_in_fp32=self.attention_softmax_in_fp32,
-                    scale=coeff,
+                    scale=None,
                 )
-
-            # Dropout. Note that for a single iteration, this layer will generate
-            # different outputs on different number of parallel partitions but
-            # on average it should not be partition dependent.
             self.dropout_p = neox_args.attention_dropout
             self.attention_dropout = nn.Dropout(self.dropout_p)
 
@@ -364,9 +221,7 @@ class ParallelSelfAttention(nn.Module):
             bias=neox_args.use_bias_in_attn_linear,
         )
 
-    def attention(
-        self, query_layer, key_layer, value_layer, layer_past, attention_mask
-    ):
+    def attention(self, query_layer, key_layer, value_layer, attention_mask):
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
@@ -415,14 +270,9 @@ class ParallelSelfAttention(nn.Module):
                 attention_mask = attention_mask[
                     ..., : attention_scores.size(3), : attention_scores.size(3)
                 ]
-
         # ===========================
         # Attention probs and dropout
         # ===========================
-
-        if exists(self.rpe):
-            rpe = self.rpe(query_layer.size(0), key_layer.size(0))
-            attention_scores += rpe  # [1, np, sq, sk]
 
         if self.pos_emb == "alibi":
             attention_scores = self.alibi_embed(attention_scores)
@@ -592,7 +442,7 @@ class ParallelSelfAttention(nn.Module):
             query_layer, key_layer, value_layer, attn_mask=attn_mask, rpe=rpe
         )
 
-    def forward(self, hidden_states, attention_mask, layer_past=None):
+    def forward(self, hidden_states, attention_mask):
 
         # hidden_states: [sq, b, h]
 
@@ -615,49 +465,9 @@ class ParallelSelfAttention(nn.Module):
             mixed_x_layer, 3
         )
 
-        if exists(self.rotary_emb):
-            if exists(self.rotary_ndims):
-                # partial rotary
-                query_rot, query_pass = (
-                    query_layer[..., : self.rotary_ndims],
-                    query_layer[..., self.rotary_ndims :],
-                )
-                key_rot, key_pass = (
-                    key_layer[..., : self.rotary_ndims],
-                    key_layer[..., self.rotary_ndims :],
-                )
-            else:
-                # full rotary
-                query_rot, key_rot = query_layer, key_layer
-
-            apply_rotary_fn = (
-                apply_rotary_pos_emb_torch if self.bf16 else apply_rotary_pos_emb
-            )
-
-            seq_len = key_layer.shape[0]
-            offset = 0
-            if exists(layer_past) and layer_past.numel() > 0:
-                offset = layer_past[0].shape[0]
-                seq_len += offset
-            cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
-            query_layer, key_layer = apply_rotary_fn(
-                query_rot, key_rot, cos, sin, offset=offset
-            )
-
-            if exists(self.rotary_ndims):
-                query_layer = torch.cat((query_layer, query_pass), dim=-1)
-                key_layer = torch.cat((key_layer, key_pass), dim=-1)
-
         # ==================================
         # Cache key and value for inference
         # ==================================
-
-        if exists(layer_past) and layer_past.numel() > 0:
-            past_key, past_value = layer_past
-            key_layer = torch.cat((past_key.type_as(key_layer), key_layer), dim=0)
-            value_layer = torch.cat(
-                (past_value.type_as(value_layer), value_layer), dim=0
-            )
 
         if self.use_cache:
             present = torch.stack((key_layer, value_layer))
@@ -666,7 +476,7 @@ class ParallelSelfAttention(nn.Module):
             context_layer = self.flash_attention(query_layer, key_layer, value_layer)
         elif not self.sparse:
             context_layer = self.attention(
-                query_layer, key_layer, value_layer, layer_past, attention_mask
+                query_layer, key_layer, value_layer, attention_mask
             )
         else:
             context_layer = self.sparse_attention(
@@ -695,10 +505,11 @@ class ParallelSelfAttention(nn.Module):
 
 
 class ParallelTransformerLayer(nn.Module):
-    """A single transformer layer.
+    """
+        A single transformer layer.
 
-    Transformer layer takes input with size [b, s, h] and returns an
-    output of the same size.
+        Transformer layer takes input with size [b, s, h] and returns an
+        output of the same size.
     """
 
     def __init__(
@@ -707,67 +518,44 @@ class ParallelTransformerLayer(nn.Module):
         attention_mask_func,
         init_method,
         output_layer_init_method,
-        layer_number,
-        rpe=None,
-        rotary=False,
         use_cache=False,
     ):
 
         super().__init__()
-        self.layer_number = layer_number
 
         norm, eps = get_norm(neox_args)
-
         # Layernorm on the input data.
         self.input_layernorm = norm(neox_args.hidden_size, eps=eps)
         self.use_cache = use_cache
 
         self.hidden_dropout = neox_args.hidden_dropout
         self.bias_dropout_fusion = neox_args.bias_dropout_fusion
-        self.gpt_j_residual = neox_args.gpt_j_residual
-        self.gpt_j_tied = neox_args.gpt_j_tied
         self.mlp_type = neox_args.mlp_type
-
-        if self.gpt_j_residual:
-            self.reduce = mpu.mappings.reduce_from_model_parallel_region
 
         # Self attention.
         self.attention = ParallelSelfAttention(
             neox_args=neox_args,
             attention_mask_func=attention_mask_func,
+            hidden_size=neox_args.hidden_size,
             init_method=init_method,
             output_layer_init_method=output_layer_init_method,
-            layer_number=layer_number,
-            rpe=rpe,
             use_cache=self.use_cache,
-            rotary=rotary,
-            parallel_output=self.gpt_j_residual,
         )
 
         # Layernorm on the output of the attention layer.
-        # If GPT-J residuals are used, this is surpurfulous but leaving it in
-        # leads to cleaner code
         self.post_attention_layernorm = norm(neox_args.hidden_size, eps=eps)
 
         # MLP
         if neox_args.mlp_type == "regular":
             self.mlp = ParallelMLP(
                 neox_args=neox_args,
+                hidden_size=neox_args.hidden_size,
+                ffn_dim=neox_args.ffn_dim,
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
-                parallel_output=self.gpt_j_residual,
-            )
-        elif neox_args.mlp_type == "llama":
-            self.mlp = LLaMAParallelMLP(
-                neox_args=neox_args,
-                init_method=init_method,
-                output_layer_init_method=output_layer_init_method,
-                parallel_output=self.gpt_j_residual,
             )
         else:
             raise KeyError(neox_args.mlp_type)
-
-        self.layer_past = None  # used to cache k/v pairs in inference
 
     def _get_bias_dropout(self):
         if self.bias_dropout_fusion:
@@ -780,107 +568,53 @@ class ParallelTransformerLayer(nn.Module):
             fn = get_bias_dropout_add(self.training)
         return fn
 
-    def forward(self, x, attention_mask, layer_past=None):
-        layer_past = layer_past if layer_past is not None else self.layer_past
+
+    def forward(self, x, attention_mask):
         bias_dropout_fn = self._get_bias_dropout()
         # x: [b, s, h]
-        if self.gpt_j_residual:
-            # pseudocode:
-            # x = x + attn(ln(x)) + mlp(ln(x))
-            # this means we can avoid doing the allreduce in the attn / mlp outputs
-            # to save communication time (we can do a single allreduce after we add mlp / attn outputs).
-            # due to a bug, the two layernorms are not tied in GPT-NeoX-20B. This is non-desirable, but
-            # we preserve the functionality for backwards compatibility
-
-            residual = x
-            # applies the correct normalization depending on if the norms are tied
-            if self.gpt_j_tied:
-                x = self.input_layernorm(x)
-                x1, x2 = x, x
-            else:
-                x1, x2 = self.input_layernorm(x), self.post_attention_layernorm(x)
-
-            # attention operator
-            attention_output, attention_bias = self.attention(
-                x1, attention_mask, layer_past=layer_past
-            )
-            if self.use_cache:
-                attention_output, presents = attention_output
-                self.layer_past = presents
-
-            with torch.enable_grad():
+        residual = x
+        # x = x + attn(ln1(x))
+        attention_output, attention_bias = self.attention(
+            self.input_layernorm(x), attention_mask
+        )
+        if self.use_cache:
+            attention_output, presents = attention_output
+            self.layer_past = presents
+        with torch.enable_grad():
+            if attention_bias is not None:
+                # Use special bias_dropout_fn if we have a bias term from the above attention layer
                 attention_output = bias_dropout_fn(
                     attention_output,
-                    bias=attention_bias.expand_as(attention_output),
-                    residual=None,
+                    bias=attention_bias.expand_as(residual),
+                    residual=residual,
                     prob=self.hidden_dropout,
                 )
+            else:
+                # Otherwise just apply dropout + residual
+                attention_output = (
+                    torch.nn.functional.dropout(
+                        attention_output,
+                        p=self.hidden_dropout,
+                        training=self.training,
+                    )
+                    + residual
+                )
 
-            # mlp operator
-            mlp_output, mlp_bias = self.mlp(x2)
-            with torch.enable_grad():
-                output = bias_dropout_fn(
+        # output = x + mlp(ln2(x))
+        mlp_output, mlp_bias = self.mlp(
+            self.post_attention_layernorm(attention_output)
+        )
+
+        with torch.enable_grad():
+            output = bias_dropout_fn(
                     mlp_output,
-                    bias=mlp_bias.expand_as(mlp_output),
+                    bias=mlp_bias.expand_as(attention_output),
                     residual=attention_output,
                     prob=self.hidden_dropout,
-                )
-
-            # output = (x + attn(ln(x)) + mlp(ln(x))
-            output = residual + self.reduce(output)
-        else:
-            # pseudocode:
-            # x = x + attn(ln1(x))
-            # x = x + mlp(ln2(x))
-
-            residual = x
-
-            # x = x + attn(ln1(x))
-            attention_output, attention_bias = self.attention(
-                self.input_layernorm(x), attention_mask, layer_past=layer_past
-            )
-            if self.use_cache:
-                attention_output, presents = attention_output
-                self.layer_past = presents
-            with torch.enable_grad():
-                if attention_bias is not None:
-                    # Use special bias_dropout_fn if we have a bias term from the above attention layer
-                    attention_output = bias_dropout_fn(
-                        attention_output,
-                        bias=attention_bias.expand_as(residual),
-                        residual=residual,
-                        prob=self.hidden_dropout,
-                    )
-                else:
-                    # Otherwise just apply dropout + residual
-                    attention_output = (
-                        torch.nn.functional.dropout(
-                            attention_output,
-                            p=self.hidden_dropout,
-                            training=self.training,
-                        )
-                        + residual
-                    )
-
-            # output = x + mlp(ln2(x))
-            mlp_output, mlp_bias = self.mlp(
-                self.post_attention_layernorm(attention_output)
-            )
-
-            with torch.enable_grad():
-                if self.mlp_type == "llama":
-                    # No dropout either
-                    assert mlp_bias is None
-                    output = mlp_output + attention_output
-                else:
-                    output = bias_dropout_fn(
-                        mlp_output,
-                        bias=mlp_bias.expand_as(attention_output),
-                        residual=attention_output,
-                        prob=self.hidden_dropout,
                     )
 
         return output
+
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
@@ -895,6 +629,7 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
         return super().forward(hidden_states, attention_mask), attention_mask
 
 
+
 class ParallelLinearPipe(ParallelLinear):
     """Another helper class to pass presents through to the output when doing inference with a Pipe Parallel model"""
 
@@ -903,7 +638,7 @@ class ParallelLinearPipe(ParallelLinear):
             args, torch.Tensor
         ), "ParallelLinearPipe expects a single argument - hidden_states"
         hidden_state = args
-        logits, bias = super().forward(hidden_state)
+        logits, _ = super().forward(hidden_state)
         return logits
 
 

@@ -12,10 +12,24 @@
    "seq_length": 2048,
    "max_position_embeddings": 2048,
    "norm": "layernorm",
-   "pos_emb": "rotary",
+   "pos_emb": "learned",
    "no_weight_tying": false,
    "gpt_j_residual": false,
    "output_layer_parallelism": "column",
+   "activation": "relu",
+
+
+   # custom model settings
+   "hidden_size": [768, 768, 768, 768],
+   "ffn_dim": [3072, 3072, 3072, 3072],
+   "layers_per_block": [3, 3, 3, 3],
+   "num_blocks": 4,
+   "head_dim": 64,
+   "max_position_embeddings": 2048,
+   "word_embed_proj_dim": 768,
+   "norm": "layernorm",
+   "activation": "relu",
+
 
    # these should provide some speedup but takes a while to build, set to true if desired
    "scaled_upper_triang_masked_softmax_fusion": false,
@@ -74,12 +88,12 @@
    },
 
    # misc. training settings
-   "train_iters": 3200,
-   "lr_decay_iters": 3200,
+   "train_iters": 320000,
+   "lr_decay_iters": 320000,
    "distributed_backend": "nccl",
    "lr_decay_style": "cosine",
    "warmup": 0.01,
-   "checkpoint_factor": 1000,
+   "checkpoint_factor": 10000,
    "eval_interval": 1000,
    "eval_iters": 10,
 
